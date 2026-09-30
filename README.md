@@ -1,4 +1,5 @@
-v0.1: OpenCV Background Subtraction & Heuristic FiltersCurrent Iteration: Uses MOG2 background subtraction and hand-tuned heuristics (aspect-ratio, circular variance) with a simulated Heavy AI stub.⚙️ How it works
+v0.1: OpenCV Background Subtraction & Heuristic FiltersCurrent Iteration: Uses MOG2 background subtraction and hand-tuned heuristics (aspect-ratio, circular variance) with a simulated Heavy AI stub.
+**⚙️ How it works**
 
 **[ Video frame ]**
 
