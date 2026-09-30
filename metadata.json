@@ -1,0 +1,6 @@
+{
+  "name": "EdgeFlow · Lightweight Edge Motion Filtering Architecture",
+  "description": "Hardware-accelerated optical flow cascade simulator eliminating false-positive AI inference via ISP vector analysis.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,848 @@
+import React, { useRef, useEffect, useState, useCallback } from 'react';
+import { 
+  Camera, 
+  CameraOff, 
+  RotateCw, 
+  FlipHorizontal, 
+  CheckCircle2, 
+  XCircle, 
+  Zap, 
+  Sliders, 
+  Eye, 
+  Info,
+  Pause,
+  Play,
+  Sparkles,
+  Video,
+  MonitorPlay,
+  RefreshCw
+} from 'lucide-react';
+import { FilterParameters } from '../types/pipeline';
+import { OpenCVOpticalFlowEngine, RealFlowResult } from '../utils/opencvAdapter';
+
+interface LiveDeviceCameraProps {
+  filterParams: FilterParameters;
+}
+
+export const LiveDeviceCamera: React.FC<LiveDeviceCameraProps> = ({ filterParams }) => {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const engineRef = useRef<OpenCVOpticalFlowEngine | null>(null);
+  const animFrameRef = useRef<number | null>(null);
+
+  const [mode, setMode] = useState<'idle' | 'webcam' | 'virtual'>('idle');
+  const [cameraError, setCameraError] = useState<string | null>(null);
+  const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
+  const [isMirrored, setIsMirrored] = useState<boolean>(true);
+  const [isFrozen, setIsFrozen] = useState<boolean>(false);
+  const [showVectors, setShowVectors] = useState<boolean>(true);
+  const [showMask, setShowMask] = useState<boolean>(true);
+  const [isOpenCvReady, setIsOpenCvReady] = useState<boolean>(false);
+  const [virtualScenario, setVirtualScenario] = useState<'human' | 'flutter_keys' | 'cloth_debris'>('human');
+
+  // Live telemetry state for UI
+  const [telemetry, setTelemetry] = useState<RealFlowResult>({
+    vectors: [],
+    pixelShiftPercent: 0,
+    hasMotion: false,
+    vectorVariance: 0,
+    netDisplacementRatio: 1.0,
+    aspectDeformation: 0,
+    currentAspectRatio: 1.0,
+    boundingBox: null,
+    stage2Passed: false,
+    verdict: 'IDLE',
+    dropReason: 'CAMERA_IDLE',
+    isOpenCvBackend: false,
+  });
+
+  const [fps, setFps] = useState<number>(30);
+  const frameCountRef = useRef<number>(0);
+  const lastFpsCalcRef = useRef<number>(performance.now());
+  const virtualTimeRef = useRef<number>(0);
+
+  // Check OpenCV state
+  useEffect(() => {
+    engineRef.current = new OpenCVOpticalFlowEngine();
+
+    const checkOpenCv = () => {
+      if (engineRef.current?.isOpenCvReady()) {
+        setIsOpenCvReady(true);
+      }
+    };
+
+    checkOpenCv();
+    window.addEventListener('opencv-ready', checkOpenCv);
+    const interval = setInterval(checkOpenCv, 1000);
+
+    return () => {
+      window.removeEventListener('opencv-ready', checkOpenCv);
+      clearInterval(interval);
+      engineRef.current?.dispose();
+    };
+  }, []);
+
+  // Create offscreen canvas for frame pixel processing
+  useEffect(() => {
+    if (!offscreenCanvasRef.current) {
+      const off = document.createElement('canvas');
+      off.width = 320;
+      off.height = 240;
+      offscreenCanvasRef.current = off;
+    }
+  }, []);
+
+  // Start Camera Stream with progressive fallback
+  const startCamera = async () => {
+    setCameraError(null);
+    try {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+      }
+
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('WebRTC Camera API (getUserMedia) is not supported or not allowed in this browser iframe context.');
+      }
+
+      let stream: MediaStream | null = null;
+
+      // 1. Try with preferred resolution & facingMode
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+            facingMode: { ideal: facingMode },
+          },
+          audio: false,
+        });
+      } catch (err1) {
+        console.warn('Initial camera constraints failed, attempting fallback to basic video...', err1);
+        // 2. Try generic video: true fallback
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: false,
+          });
+        } catch (err2) {
+          throw err2;
+        }
+      }
+
+      if (!stream) {
+        throw new Error('No video stream received from camera device.');
+      }
+
+      streamRef.current = stream;
+
+      const video = videoRef.current;
+      if (video) {
+        video.srcObject = stream;
+        video.muted = true;
+        video.playsInline = true;
+        video.autoplay = true;
+
+        // Ensure play begins once metadata is loaded
+        video.onloadedmetadata = () => {
+          video.play().catch((e) => console.warn('video.play() rejected:', e));
+        };
+      }
+
+      setMode('webcam');
+    } catch (err: any) {
+      console.error('Camera access error:', err);
+      let errorMsg = err.message || 'Camera permission denied or device busy.';
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        errorMsg = 'Camera permission was denied. Please click the camera icon in your browser URL bar to allow access, or use the "Virtual Demo Camera" below.';
+      } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+        errorMsg = 'No physical camera detected on this system. You can test all optical flow features using the "Virtual Demo Camera".';
+      }
+      setCameraError(errorMsg);
+      setMode('idle');
+    }
+  };
+
+  // Stop Camera Stream
+  const stopCamera = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+    setMode('idle');
+    setCameraError(null);
+  };
+
+  // Start Virtual Camera Mode
+  const startVirtualCamera = () => {
+    stopCamera();
+    setMode('virtual');
+    setCameraError(null);
+  };
+
+  // Toggle Camera Facing Mode (Front / Rear)
+  const toggleFacingMode = () => {
+    const next = facingMode === 'user' ? 'environment' : 'user';
+    setFacingMode(next);
+    setIsMirrored(next === 'user');
+    if (mode === 'webcam') {
+      stopCamera();
+      setTimeout(startCamera, 200);
+    }
+  };
+
+  // Main processing loop
+  useEffect(() => {
+    if (mode === 'idle' || isFrozen) return;
+
+    const canvas = canvasRef.current;
+    const offCanvas = offscreenCanvasRef.current;
+    if (!canvas || !offCanvas) return;
+
+    const ctx = canvas.getContext('2d');
+    const offCtx = offCanvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx || !offCtx) return;
+
+    const loop = () => {
+      if (isFrozen) return;
+
+      const w = canvas.width;
+      const h = canvas.height;
+      const offW = offCanvas.width;
+      const offH = offCanvas.height;
+
+      // Clear main canvas overlay
+      ctx.clearRect(0, 0, w, h);
+
+      if (mode === 'webcam') {
+        const video = videoRef.current;
+        if (video && video.readyState >= 2) {
+          // Render current video frame to offscreen canvas for vector analysis
+          offCtx.save();
+          if (isMirrored) {
+            offCtx.translate(offW, 0);
+            offCtx.scale(-1, 1);
+          }
+          offCtx.drawImage(video, 0, 0, offW, offH);
+          offCtx.restore();
+
+          // Extract frame data and run Optical Flow
+          const imgData = offCtx.getImageData(0, 0, offW, offH);
+          if (engineRef.current) {
+            const result = engineRef.current.processFrame(imgData, 20, {
+              varianceThreshold: filterParams.varianceThreshold,
+              minNetDisplacement: filterParams.minNetDisplacement,
+              maxAspectDeformation: filterParams.maxAspectDeformation,
+            });
+
+            setTelemetry(result);
+
+            // Scale factor between offscreen analysis and display canvas
+            const scaleX = w / offW;
+            const scaleY = h / offH;
+
+            // Render Stage 1 Pixel Mask
+            if (showMask && result.hasMotion && result.boundingBox) {
+              const b = result.boundingBox;
+              ctx.fillStyle = 'rgba(234, 179, 8, 0.22)';
+              ctx.strokeStyle = 'rgba(234, 179, 8, 0.7)';
+              ctx.lineWidth = 1.5;
+              ctx.fillRect(b.x * scaleX, b.y * scaleY, b.width * scaleX, b.height * scaleY);
+              ctx.strokeRect(b.x * scaleX, b.y * scaleY, b.width * scaleX, b.height * scaleY);
+            }
+
+            // Render Stage 2 Macroblock Vectors
+            if (showVectors && result.vectors.length > 0) {
+              ctx.lineWidth = 2.5;
+              result.vectors.forEach((v) => {
+                const vx = v.x * scaleX;
+                const vy = v.y * scaleY;
+                const vdx = v.dx * scaleX * 2.2;
+                const vdy = v.dy * scaleY * 2.2;
+
+                const vectorColor = result.stage2Passed ? '#34d399' : '#f87171';
+                ctx.strokeStyle = vectorColor;
+                ctx.fillStyle = vectorColor;
+
+                ctx.beginPath();
+                ctx.moveTo(vx, vy);
+                ctx.lineTo(vx + vdx, vy + vdy);
+                ctx.stroke();
+
+                // Arrowhead
+                const angle = Math.atan2(vdy, vdx);
+                const headLen = 5;
+                ctx.beginPath();
+                ctx.moveTo(vx + vdx, vy + vdy);
+                ctx.lineTo(
+                  vx + vdx - headLen * Math.cos(angle - Math.PI / 6),
+                  vy + vdy - headLen * Math.sin(angle - Math.PI / 6)
+                );
+                ctx.lineTo(
+                  vx + vdx - headLen * Math.cos(angle + Math.PI / 6),
+                  vy + vdy - headLen * Math.sin(angle + Math.PI / 6)
+                );
+                ctx.fill();
+              });
+            }
+
+            // Render Stage 3 Bounding Box & Annotation
+            if (result.hasMotion && result.boundingBox) {
+              const b = result.boundingBox;
+              const bx = b.x * scaleX;
+              const by = b.y * scaleY;
+              const bw = b.width * scaleX;
+              const bh = b.height * scaleY;
+
+              ctx.save();
+              if (result.stage2Passed) {
+                // PASS TO AI
+                ctx.strokeStyle = '#10b981';
+                ctx.lineWidth = 3;
+                ctx.strokeRect(bx, by, bw, bh);
+
+                ctx.fillStyle = '#064e3b';
+                ctx.fillRect(bx, Math.max(0, by - 26), 220, 24);
+                ctx.fillStyle = '#6ee7b7';
+                ctx.font = '11px "JetBrains Mono", monospace';
+                ctx.fillText('STAGE 3 AI: HUMAN KINEMATICS', bx + 6, Math.max(0, by - 26) + 16);
+              } else {
+                // DROPPED AT STAGE 2
+                ctx.strokeStyle = 'rgba(239, 68, 68, 0.85)';
+                ctx.lineWidth = 2;
+                ctx.setLineDash([4, 4]);
+                ctx.strokeRect(bx, by, bw, bh);
+                ctx.setLineDash([]);
+
+                ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
+                ctx.fillRect(bx, Math.max(0, by - 24), 210, 22);
+                ctx.fillStyle = '#f87171';
+                ctx.font = '10px "JetBrains Mono", monospace';
+                ctx.fillText('STAGE 2: FILTERED (DROP NOISE)', bx + 6, Math.max(0, by - 24) + 15);
+              }
+              ctx.restore();
+            }
+          }
+        }
+      } else if (mode === 'virtual') {
+        // Virtual Camera Motion Simulator: Renders synthetic video into offscreen canvas,
+        // then runs the EXACT SAME OpenCV optical flow code!
+        virtualTimeRef.current += 0.033;
+        const t = virtualTimeRef.current;
+
+        // Render synthetic room backdrop
+        offCtx.fillStyle = '#1e293b';
+        offCtx.fillRect(0, 0, offW, offH);
+        // Floor
+        offCtx.fillStyle = '#0f172a';
+        offCtx.fillRect(0, offH * 0.65, offW, offH * 0.35);
+
+        // Render moving target based on scenario
+        if (virtualScenario === 'human') {
+          // Human walking smoothly across the screen: Coherent translation, stable aspect ratio
+          const walkX = (Math.sin(t * 0.8) * 0.35 + 0.5) * offW;
+          const walkY = offH * 0.55;
+          const hw = 30;
+          const hh = 75;
+          // Body
+          offCtx.fillStyle = '#38bdf8';
+          offCtx.fillRect(walkX - hw / 2, walkY - hh / 2, hw, hh);
+          // Head
+          offCtx.fillStyle = '#f8fafc';
+          offCtx.beginPath();
+          offCtx.arc(walkX, walkY - hh / 2 - 12, 10, 0, Math.PI * 2);
+          offCtx.fill();
+        } else if (virtualScenario === 'flutter_keys') {
+          // Rapid erratic insect / key flutter: High angular variance
+          const mothX = offW * 0.5 + Math.sin(t * 12) * 45;
+          const mothY = offH * 0.4 + Math.cos(t * 16) * 35;
+          offCtx.fillStyle = '#f43f5e';
+          offCtx.beginPath();
+          offCtx.arc(mothX, mothY, 14, 0, Math.PI * 2);
+          offCtx.fill();
+        } else {
+          // Debris / cloth: continuously deforming aspect ratio
+          const debrisX = offW * 0.5 + Math.sin(t * 1.5) * 60;
+          const debrisY = offH * 0.5;
+          const stretchW = 40 + Math.sin(t * 8) * 28;
+          const stretchH = 40 + Math.cos(t * 7) * 28;
+          offCtx.fillStyle = '#fbbf24';
+          offCtx.fillRect(debrisX - stretchW / 2, debrisY - stretchH / 2, stretchW, stretchH);
+        }
+
+        // Draw virtual camera video directly to main canvas background
+        ctx.drawImage(offCanvas, 0, 0, w, h);
+
+        // Now feed the image data to OpenCVOpticalFlowEngine
+        const imgData = offCtx.getImageData(0, 0, offW, offH);
+        if (engineRef.current) {
+          const result = engineRef.current.processFrame(imgData, 20, {
+            varianceThreshold: filterParams.varianceThreshold,
+            minNetDisplacement: filterParams.minNetDisplacement,
+            maxAspectDeformation: filterParams.maxAspectDeformation,
+          });
+
+          setTelemetry(result);
+
+          // Render vectors & bounding boxes
+          const scaleX = w / offW;
+          const scaleY = h / offH;
+
+          if (showVectors && result.vectors.length > 0) {
+            ctx.lineWidth = 2.5;
+            result.vectors.forEach((v) => {
+              const vectorColor = result.stage2Passed ? '#34d399' : '#f87171';
+              ctx.strokeStyle = vectorColor;
+              ctx.fillStyle = vectorColor;
+              ctx.beginPath();
+              ctx.moveTo(v.x * scaleX, v.y * scaleY);
+              ctx.lineTo((v.x + v.dx * 2.5) * scaleX, (v.y + v.dy * 2.5) * scaleY);
+              ctx.stroke();
+            });
+          }
+
+          if (result.hasMotion && result.boundingBox) {
+            const b = result.boundingBox;
+            ctx.strokeStyle = result.stage2Passed ? '#10b981' : '#f43f5e';
+            ctx.lineWidth = 2.5;
+            ctx.strokeRect(b.x * scaleX, b.y * scaleY, b.width * scaleX, b.height * scaleY);
+
+            ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
+            ctx.fillRect(b.x * scaleX, Math.max(0, b.y * scaleY - 24), 210, 22);
+            ctx.fillStyle = result.stage2Passed ? '#6ee7b7' : '#f87171';
+            ctx.font = '10px "JetBrains Mono", monospace';
+            ctx.fillText(
+              result.stage2Passed ? 'STAGE 3 AI: HUMAN KINEMATICS' : 'STAGE 2: FILTERED (DROP NOISE)',
+              b.x * scaleX + 6,
+              Math.max(0, b.y * scaleY - 24) + 15
+            );
+          }
+        }
+      }
+
+      // Calculate Frame FPS
+      frameCountRef.current++;
+      const now = performance.now();
+      if (now - lastFpsCalcRef.current >= 1000) {
+        setFps(frameCountRef.current);
+        frameCountRef.current = 0;
+        lastFpsCalcRef.current = now;
+      }
+
+      animFrameRef.current = requestAnimationFrame(loop);
+    };
+
+    animFrameRef.current = requestAnimationFrame(loop);
+
+    return () => {
+      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+    };
+  }, [mode, isFrozen, isMirrored, showVectors, showMask, filterParams, virtualScenario]);
+
+  return (
+    <div className="space-y-6">
+      {/* Device Camera Control Header */}
+      <div className="flex flex-wrap items-center justify-between gap-4 p-4 bg-slate-900/60 border border-slate-800 rounded-xl">
+        <div className="flex items-center gap-3">
+          <div className={`p-2 rounded-lg ${
+            mode === 'webcam' ? 'bg-emerald-950 text-emerald-400' : mode === 'virtual' ? 'bg-cyan-950 text-cyan-400' : 'bg-slate-800 text-slate-400'
+          }`}>
+            <Camera className="w-5 h-5" />
+          </div>
+          <div>
+            <h3 className="text-sm font-bold text-white flex items-center gap-2">
+              <span>Live Device Camera Prototype</span>
+              <span className={`text-[10px] font-mono px-2 py-0.5 rounded border ${
+                isOpenCvReady 
+                  ? 'bg-emerald-950/80 text-emerald-300 border-emerald-800/80' 
+                  : 'bg-cyan-950/80 text-cyan-300 border-cyan-800/80'
+              }`}>
+                {isOpenCvReady ? 'OpenCV.js Ready (WASM)' : 'ISP Macroblock Kernel'}
+              </span>
+              {mode === 'webcam' && (
+                <span className="text-[10px] font-mono text-emerald-400 flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                  Live Webcam
+                </span>
+              )}
+              {mode === 'virtual' && (
+                <span className="text-[10px] font-mono text-cyan-400">
+                  Virtual Camera Test Stream
+                </span>
+              )}
+            </h3>
+            <p className="text-xs text-slate-400">
+              Computes optical flow vectors in real time to filter noise and pass structured human motion.
+            </p>
+          </div>
+        </div>
+
+        {/* Action Buttons */}
+        <div className="flex flex-wrap items-center gap-2">
+          {mode === 'idle' ? (
+            <>
+              <button
+                onClick={startCamera}
+                className="px-4 py-2 text-xs font-semibold text-slate-950 bg-emerald-400 rounded-lg hover:bg-emerald-300 transition-colors flex items-center gap-2 cursor-pointer shadow-sm shadow-emerald-500/20"
+              >
+                <Camera className="w-4 h-4" />
+                <span>Enable Device Camera</span>
+              </button>
+              <button
+                onClick={startVirtualCamera}
+                className="px-3.5 py-2 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition-colors flex items-center gap-2 cursor-pointer"
+              >
+                <MonitorPlay className="w-4 h-4 text-cyan-400" />
+                <span>Virtual Demo Camera</span>
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                onClick={() => setIsFrozen(!isFrozen)}
+                className="px-3 py-1.5 text-xs font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
+                title={isFrozen ? 'Resume live feed' : 'Freeze frame to inspect vector math'}
+              >
+                {isFrozen ? <Play className="w-3.5 h-3.5 text-emerald-400" /> : <Pause className="w-3.5 h-3.5" />}
+                <span>{isFrozen ? 'Resume' : 'Freeze'}</span>
+              </button>
+
+              {mode === 'webcam' && (
+                <>
+                  <button
+                    onClick={() => setIsMirrored(!isMirrored)}
+                    className="p-2 text-slate-300 bg-slate-800 hover:bg-slate-700 rounded-lg transition-colors cursor-pointer"
+                    title="Mirror Camera View"
+                  >
+                    <FlipHorizontal className="w-4 h-4" />
+                  </button>
+                  <button
+                    onClick={toggleFacingMode}
+                    className="p-2 text-slate-300 bg-slate-800 hover:bg-slate-700 rounded-lg transition-colors cursor-pointer"
+                    title="Switch Camera (Front / Rear)"
+                  >
+                    <RotateCw className="w-4 h-4" />
+                  </button>
+                </>
+              )}
+
+              {mode === 'virtual' && (
+                <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-lg border border-slate-800">
+                  <button
+                    onClick={() => setVirtualScenario('human')}
+                    className={`px-2 py-1 text-[11px] font-medium rounded ${
+                      virtualScenario === 'human' ? 'bg-slate-800 text-white' : 'text-slate-400'
+                    }`}
+                  >
+                    Human Walk
+                  </button>
+                  <button
+                    onClick={() => setVirtualScenario('flutter_keys')}
+                    className={`px-2 py-1 text-[11px] font-medium rounded ${
+                      virtualScenario === 'flutter_keys' ? 'bg-slate-800 text-white' : 'text-slate-400'
+                    }`}
+                  >
+                    Erratic Flutter
+                  </button>
+                  <button
+                    onClick={() => setVirtualScenario('cloth_debris')}
+                    className={`px-2 py-1 text-[11px] font-medium rounded ${
+                      virtualScenario === 'cloth_debris' ? 'bg-slate-800 text-white' : 'text-slate-400'
+                    }`}
+                  >
+                    Debris Tumbling
+                  </button>
+                </div>
+              )}
+
+              <button
+                onClick={stopCamera}
+                className="px-3.5 py-1.5 text-xs font-semibold text-rose-300 bg-rose-950/80 border border-rose-800/80 hover:bg-rose-900 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
+              >
+                <CameraOff className="w-3.5 h-3.5" />
+                <span>Stop</span>
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Camera Error / Permission Notice */}
+      {cameraError && (
+        <div className="p-4 bg-slate-900 border border-rose-800/80 rounded-xl text-xs space-y-3">
+          <div className="flex items-start gap-2.5 text-rose-300">
+            <XCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <span className="font-semibold block">Camera Access Notice:</span>
+              <p className="text-slate-300 leading-relaxed">{cameraError}</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 pl-6">
+            <button
+              onClick={startVirtualCamera}
+              className="px-3 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold rounded text-xs transition-colors flex items-center gap-1.5 cursor-pointer"
+            >
+              <MonitorPlay className="w-3.5 h-3.5" />
+              <span>Use Virtual Demo Camera Instead</span>
+            </button>
+            <button
+              onClick={startCamera}
+              className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded text-xs transition-colors flex items-center gap-1.5 cursor-pointer"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Retry Permission</span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Main Viewport Grid */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+        {/* Camera Viewport (Left 8 cols) */}
+        <div className="lg:col-span-8 space-y-3">
+          <div className="relative rounded-xl overflow-hidden border border-slate-800 bg-slate-950 shadow-2xl aspect-[4/3]">
+            {/* Live Hardware Video Element (rendered directly for guaranteed 60fps & no black frames) */}
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted
+              className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-300 ${
+                mode === 'webcam' ? 'opacity-100' : 'opacity-0 pointer-events-none'
+              } ${isMirrored ? 'scale-x-[-1]' : ''}`}
+            />
+
+            {/* Canvas Overlay for Vectors & Bounding Boxes */}
+            <canvas
+              ref={canvasRef}
+              width={640}
+              height={480}
+              className="absolute inset-0 w-full h-full object-cover block z-10"
+            />
+
+            {/* When Camera is idle: Friendly Launch Splash */}
+            {mode === 'idle' && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center space-y-4 bg-slate-950 z-20">
+                <div className="p-4 rounded-full bg-slate-900 border border-slate-800 text-slate-400">
+                  <Camera className="w-8 h-8 text-emerald-400" />
+                </div>
+                <div className="max-w-md space-y-1.5">
+                  <h4 className="text-base font-bold text-white">Camera Prototype Ready</h4>
+                  <p className="text-xs text-slate-400 leading-relaxed">
+                    Connect your webcam to test the real-time optical flow vector analysis pipeline, or use the Virtual Demo Stream to test physical motion scenarios.
+                  </p>
+                </div>
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={startCamera}
+                    className="px-4 py-2 text-xs font-semibold text-slate-950 bg-emerald-400 rounded-lg hover:bg-emerald-300 transition-colors flex items-center gap-2 cursor-pointer shadow-sm shadow-emerald-500/20"
+                  >
+                    <Camera className="w-4 h-4" />
+                    <span>Launch Device Camera</span>
+                  </button>
+                  <button
+                    onClick={startVirtualCamera}
+                    className="px-4 py-2 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition-colors flex items-center gap-2 cursor-pointer"
+                  >
+                    <MonitorPlay className="w-4 h-4 text-cyan-400" />
+                    <span>Virtual Demo Stream</span>
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* In-canvas overlay settings */}
+            {mode !== 'idle' && (
+              <div className="absolute bottom-3 right-3 flex items-center gap-2 bg-slate-950/85 backdrop-blur-md px-3 py-1.5 rounded-lg border border-slate-800 text-xs z-30">
+                <label className="flex items-center gap-1.5 cursor-pointer text-slate-300 hover:text-white">
+                  <input
+                    type="checkbox"
+                    checked={showVectors}
+                    onChange={(e) => setShowVectors(e.target.checked)}
+                    className="rounded bg-slate-900 border-slate-700 text-emerald-500 focus:ring-0"
+                  />
+                  <span>Vector Arrows</span>
+                </label>
+                <span className="text-slate-600">·</span>
+                <label className="flex items-center gap-1.5 cursor-pointer text-slate-300 hover:text-white">
+                  <input
+                    type="checkbox"
+                    checked={showMask}
+                    onChange={(e) => setShowMask(e.target.checked)}
+                    className="rounded bg-slate-900 border-slate-700 text-emerald-500 focus:ring-0"
+                  />
+                  <span>Stage 1 Mask</span>
+                </label>
+              </div>
+            )}
+          </div>
+
+          {/* Real-World Quick Testing Playbook */}
+          <div className="p-4 bg-slate-900/40 border border-slate-800/80 rounded-xl space-y-2.5">
+            <h4 className="text-xs font-semibold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+              <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Physical Motion Experiments (Try with Your Camera)</span>
+            </h4>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+              <div className="p-2.5 bg-slate-950 rounded-lg border border-slate-800/80 space-y-1">
+                <span className="font-semibold text-rose-400 block">1. Erratic Jitter Test</span>
+                <p className="text-[11px] text-slate-400 leading-tight">
+                  Rapidly shake keys or flutter fingers in circles $\rightarrow$ Angular variance spikes $\rightarrow$ <strong>DROPPED (Noise)</strong>.
+                </p>
+              </div>
+              <div className="p-2.5 bg-slate-950 rounded-lg border border-slate-800/80 space-y-1">
+                <span className="font-semibold text-amber-400 block">2. Debris / Cloth Test</span>
+                <p className="text-[11px] text-slate-400 leading-tight">
+                  Tumble a napkin or crumpled cloth $\rightarrow$ Aspect ratio deforms continuously $\rightarrow$ <strong>DROPPED (Debris)</strong>.
+                </p>
+              </div>
+              <div className="p-2.5 bg-slate-950 rounded-lg border border-slate-800/80 space-y-1">
+                <span className="font-semibold text-emerald-400 block">3. Human Motion Test</span>
+                <p className="text-[11px] text-slate-400 leading-tight">
+                  Walk or step across the frame with upright posture $\rightarrow$ Coherent translation verified $\rightarrow$ <strong>PASS TO AI</strong>!
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Live Vector Telemetry & Decision Inspector (Right 4 cols) */}
+        <div className="lg:col-span-4 space-y-4">
+          <div className="p-5 bg-slate-900/70 border border-slate-800 rounded-xl space-y-4">
+            <div className="flex items-start justify-between">
+              <div>
+                <span className="text-xs text-slate-500 font-mono">LIVE ISP TELEMETRY</span>
+                <h3 className="text-base font-semibold text-white tracking-tight">
+                  Optical Flow Analyzer
+                </h3>
+              </div>
+              <div className={`px-2.5 py-1 rounded text-xs font-mono font-medium ${
+                telemetry.verdict === 'PASS to AI'
+                  ? 'bg-emerald-950 text-emerald-400 border border-emerald-800/60'
+                  : telemetry.verdict === 'DROP (Noise)'
+                  ? 'bg-rose-950 text-rose-400 border border-rose-800/60'
+                  : 'bg-slate-800 text-slate-400'
+              }`}>
+                {telemetry.verdict}
+              </div>
+            </div>
+
+            {/* Live Numerical Readouts */}
+            <div className="space-y-3 pt-2 border-t border-slate-800">
+              {/* Metric 1: Angular Variance */}
+              <div className="space-y-1">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-slate-400">Angular Vector Variance:</span>
+                  <span className="font-mono tabular-nums text-slate-200">
+                    {telemetry.vectorVariance.toFixed(1)}°
+                    <span className="text-slate-500 text-[10px] ml-1">/ max {filterParams.varianceThreshold}°</span>
+                  </span>
+                </div>
+                <div className="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
+                  <div
+                    className={`h-full transition-all duration-150 ${
+                      telemetry.vectorVariance < filterParams.varianceThreshold
+                        ? 'bg-emerald-500'
+                        : 'bg-rose-500'
+                    }`}
+                    style={{
+                      width: `${Math.min(100, (telemetry.vectorVariance / (filterParams.varianceThreshold * 2)) * 100)}%`,
+                    }}
+                  />
+                </div>
+              </div>
+
+              {/* Metric 2: Net Displacement */}
+              <div className="space-y-1">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-slate-400">Net Displacement Ratio:</span>
+                  <span className="font-mono tabular-nums text-slate-200">
+                    {(telemetry.netDisplacementRatio * 100).toFixed(0)}%
+                    <span className="text-slate-500 text-[10px] ml-1">/ min {(filterParams.minNetDisplacement * 100).toFixed(0)}%</span>
+                  </span>
+                </div>
+                <div className="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
+                  <div
+                    className={`h-full transition-all duration-150 ${
+                      telemetry.netDisplacementRatio >= filterParams.minNetDisplacement
+                        ? 'bg-emerald-500'
+                        : 'bg-amber-500'
+                    }`}
+                    style={{
+                      width: `${telemetry.netDisplacementRatio * 100}%`,
+                    }}
+                  />
+                </div>
+              </div>
+
+              {/* Metric 3: Shape Deformation */}
+              <div className="space-y-1">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-slate-400">Shape Deformation Rate (ΔAR):</span>
+                  <span className="font-mono tabular-nums text-slate-200">
+                    {telemetry.aspectDeformation.toFixed(2)}
+                    <span className="text-slate-500 text-[10px] ml-1">/ max {filterParams.maxAspectDeformation.toFixed(2)}</span>
+                  </span>
+                </div>
+                <div className="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
+                  <div
+                    className={`h-full transition-all duration-150 ${
+                      telemetry.aspectDeformation <= filterParams.maxAspectDeformation
+                        ? 'bg-emerald-500'
+                        : 'bg-rose-500'
+                    }`}
+                    style={{
+                      width: `${Math.min(100, (telemetry.aspectDeformation / (filterParams.maxAspectDeformation * 2)) * 100)}%`,
+                    }}
+                  />
+                </div>
+              </div>
+
+              {/* Pixel Shift Load */}
+              <div className="flex items-center justify-between text-xs pt-1 border-t border-slate-800/60">
+                <span className="text-slate-400">Stage 1 Pixel Shift:</span>
+                <span className="font-mono tabular-nums text-slate-300">
+                  {telemetry.pixelShiftPercent.toFixed(1)}% of frame
+                </span>
+              </div>
+            </div>
+
+            {/* Verdict Explanation Box */}
+            <div className={`p-3 rounded-lg text-xs space-y-1 ${
+              telemetry.stage2Passed
+                ? 'bg-emerald-950/40 border border-emerald-900/60 text-emerald-300'
+                : 'bg-slate-950/70 border border-slate-800 text-slate-300'
+            }`}>
+              <div className="font-semibold text-slate-200">Current Pipeline Decision:</div>
+              <div className="font-mono text-[11px]">
+                {telemetry.dropReason}
+              </div>
+            </div>
+          </div>
+
+          {/* Hardware & Stream Stats */}
+          <div className="p-4 bg-slate-900/70 border border-slate-800 rounded-xl space-y-2 text-xs">
+            <span className="text-slate-400 font-semibold uppercase tracking-wider block text-[10px]">
+              Active Stream Details
+            </span>
+            <div className="grid grid-cols-2 gap-2">
+              <div className="p-2 bg-slate-950 rounded border border-slate-800">
+                <span className="text-slate-500 block text-[10px]">Engine FPS</span>
+                <span className="font-mono text-emerald-400 font-semibold">{fps} FPS</span>
+              </div>
+              <div className="p-2 bg-slate-950 rounded border border-slate-800">
+                <span className="text-slate-500 block text-[10px]">Vectors Tracked</span>
+                <span className="font-mono text-cyan-400 font-semibold">{telemetry.vectors.length} blocks</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
