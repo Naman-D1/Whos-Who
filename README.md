@@ -1,84 +1,101 @@
-v0.1: OpenCV Background Subtraction & Heuristic FiltersCurrent Iteration: Uses MOG2 background subtraction and hand-tuned heuristics (aspect-ratio, circular variance) with a simulated Heavy AI stub.
-**⚙️ How it works**
+***Who's who?***
 
-**[ Video frame ]**
+A browser-based prototype of a motion-filtering cascade for edge cameras: cheap motion cues decide whether an expensive AI model needs to run at all, so a wind-blown bag or a moth doesn't wake the heavy model but a person or vehicle does.
 
-=========================================
- STAGE 1: Motion detection
-=========================================
- Gaussian blur 
-  → MOG2 background subtraction 
-  → shadow removal
-  → morphological open + dilate 
-  → contour boxes (small blobs dropped)
+Current version: v2: temporal speculation.
 
- 
-=========================================
- Tracking
-=========================================
- One-to-one nearest-centroid matching
- (tracks expire after 10 missed frames)
+*See What's new in v2...*
 
+The project is a React + TypeScript + Vite app. 
+How the cascade works
+Frame ──► Stage 1: pixel change ──► Stage 2: motion heuristics ──► Stage 3: heavy AI
+          (is anything moving?)      (does it move like an agent?)   (what is it?)
 
-=========================================
- STAGE 2: Motion heuristics 
-=========================================
- (Evaluated per track, over recent frames)
- • Aspect-ratio fluctuation (coefficient of variation)
- • Optical-flow direction scatter (circular variance)
- • Trajectory jitter (normalised by box size)
- → Classified as "agent-like" or "noise-like"
+Stage 1: pixel motion. Frame differencing on luminance; a frame counts as "moving" only if enough of it changed.
 
+Stage 2: motion heuristics. Per object, over recent frames:
 
+Check	What it measures	Typical culprit it drops
+Angular variance	How scattered the motion directions are	Insects
+Net displacement ratio	Net distance ÷ total path length	Swaying foliage
+Aspect deformation (ΔAR)	How fast the shape changes	Tumbling debris
+Temporal erratic score (v2)	How badly a constant-velocity predictor misses the next position	Unpredictable movers (debris, insects)
 
-=========================================
- STAGE 3: Heavy AI (simulated)
-=========================================
- Runs only after a track passes Stage 2 
- for 3 consecutive frames, then cached 
- and refreshed every 15 frames per track.
-The primary goal is to minimise heavy-AI calls while still catching every real person.📋 RequirementsPython 3.8+opencv-pythonnumpypip install opencv-python numpy
-🚀 Usagepython edge_motion_filter.py your_video.mp4
-FlagDescriptionDefault--width NProcessing width in pixels. Lower is faster.640--warmup NFrames for the background model to learn before detection starts.60--save out.mp4Write the annotated video to a file.off--no-displayRun without a window and print progress to the console.off--realtimeThrottle playback to the video's own FPS.off (max speed)Examples:# Watch it live
-python edge_motion_filter.py hallway.mp4
+Stage 3: heavy AI. Runs only on objects that pass Stage 2. It is a stub (see Known limitations).
 
-# Headless run that saves an annotated demo clip
-python edge_motion_filter.py hallway.mp4 --no-display --save demo_out.mp4
+Running it
 
-# Lighter processing for a slower machine
-python edge_motion_filter.py hallway.mp4 --width 480
-Controls: q quits, Space pauses.📊
+Requires a recent Node.js (tested on Node 22).
 
-**Reading the OutputBox:**
-Colour:          Meaning:
-🟩 Green         Passed 
+bash
+npm install
+npm run dev      # http://localhost:3000
 
-Stage 2;
-(The heavy AI has been woken for this track)
-🟨 Yellow        Looks agent-like, but hasn't yet passed 3 frames in a row
-🟥 Red           Filtered out as noise or debris
+Other scripts: npm run build (production build), npm run lint (type-check).
 
-The top-left overlay shows heavy-AI calls versus frames processed and the current pipeline FPS. When the run ends, a summary prints the total frames, heavy calls, the percentage of frames that triggered a call, and the average speed.
+No API key is needed. .env.example contains a Gemini key placeholder inherited from the Google AI Studio template, but nothing in src/ uses it.
 
-**💡 Tips for Good Demo Footage**
-Use a fixed camera. 
-Background subtraction assumes a static scene, so shaky or panning footage will confuse it.
-The most convincing clips have a person and non-human motion in the same scene, such as someone walking past a blowing plastic bag or leaves.
-Let the first ~2 seconds be mostly empty if you can. The warm-up period is used to learn the background.
-A person who stands completely still will eventually be absorbed into the background and lose their box. This is a known limitation of MOG2.
+The camera tab asks for webcam permission. Browsers only allow this on localhost or HTTPS.
 
-**🎛️ Tuning**
-The Stage 2 thresholds live in EdgeMotionFilter.looks_like_agent:ThresholdMeaningLoosen if...ar_cv > 0.30Aspect-ratio variation.
-People with swinging arms are marked as noisecirc_var > 0.75F low direction scatter (0 = coherent, 1 = random). Real people get red boxestraj_instab > 0.06.
-Trajectory jitter relative to box size. Tracks flicker between red and green. Other knobs in the EdgeMotionFilter constructor: wake_streak (consecutive passes before waking the heavy model), heavy_refresh (frames between re-runs per track), max_missed, match_dist_frac, and min_area_frac.
+The app's tabs
+Tab	What it is
+Device Camera (OpenCV)	Live webcam through the frame-differencing + block-matching engine in src/utils/opencvAdapter.ts
+Synthetic Simulator	Scripted objects (person, vehicle, trash, insect, foliage) through the full cascade. Best place to see v2.
+Architecture Spec	Walkthrough of the cascade design
+Signal Profiles	The Stage 2 criteria and the signal signature each object class produces
+Hardware Benchmarks	Modelled power figures for example SoCs (src/utils/hardwareProfiles.ts)
+TCO calculator	Fleet cost model built on those same figures
 
-*Note:* These values are hand-picked starting points, not validated numbers. Expect to adjust them for your footage.
+The hardware and TCO tabs show modelled numbers, hardcoded constants. Nothing in this repo measures real hardware.
 
-**⚠️ Known Limitations**
-The heuristics are probabalitic. Walking humans have swinging limbs and can look less rigid than a sliding box, so the rules may rarely reject real people.
-Stationary people fade out as MOG2 absorbs them into the background.
-No camera-motion compensation.
-The heavy AI is a stub. 
-heavy_ai_inference sleeps for 20 ms and returns "Human/Child". It doesn't actually classify anything yet. 
+What's new in v2: temporal speculation
 
-**We are aiming to eliminate most of these limitations in future versions/updates**
+v2 adds a per-object score for how predictable its motion has been, and a projection of where it will go next.
+
+How it works (src/utils/temporalSpeculation.ts, one pure function, speculate(history)):
+
+Prediction error: predict each step from the previous two with a constant-velocity model, and measure the miss relative to the object's speed.
+Turn rate: mean heading change per frame on frames where the object is actually moving.
+Straightness: net displacement ÷ path length.
+These combine into an erratic score (0 = smooth, 1 = erratic) and a class: smooth_translating, oscillating, erratic, or warmup.
+The next 12 positions are projected with damping that grows with the erratic score, so uncertain tracks fade toward standing still.
+
+In the simulator:
+
+Dashed blue ghost paths show each object's projected route, fading with confidence.
+The Stage 2 panel has a new Temporal Erratic Score row.
+The tuner has a Temporal Speculation card with an ON / OFF (v1) switch and a max-score slider, so v1 and v2 can be compared live.
+Tracks above the cutoff are dropped with the reason UNPREDICTABLE_TRAJECTORY.
+
+Simulator A/B result (60 randomized runs; share of frames passed on to Stage 3):
+
+Object	v1	v2
+Person	100%	100%
+Child	100%	100%
+Vehicle	100%	100%
+Windblown trash	100%	~0.6%
+Swaying foliage	~38%	~0.6%
+Insect	~4%	0%
+
+Read these numbers carefully. They come from the simulator's own synthetic, noiseless motion, and the default cutoff (0.1) was chosen against that same data. They show the gate works as designed, not how it will perform on real footage. Real tracked-box centroids jitter, so real people will score higher than the simulated ones and the cutoff will need re-tuning on real clips.
+
+Other change: package.json pinned esbuild ^0.25, which conflicted with Vite 8's peer range, so a clean npm install failed with ERESOLVE. It is now ^0.27.
+
+Known limitations
+The live-camera path does not use v2. It draws a single bounding box around everything that changed in the frame, with no per-object tracking, so a person and a plastic bag in view merge into one object. Temporal scoring needs per-object tracks. (historyTrajectories in opencvAdapter.ts is collected but not used in the decision.)
+The simulator partly grades itself. Stage 3 labels and strideFrequency are looked up from the object's type, not computed from motion, and the object kinematics were written to look like their class. Simulator results demonstrate the pipeline's logic, not detection accuracy.
+Stage 3 is a stub. No model runs; "AI classification" is a lookup.
+Thresholds are unvalidated against real footage (Stage 2 defaults and the v2 cutoff alike).
+No automated tests.
+Roadmap
+Blob tracker for the live path: group active macroblocks into blobs, match them to tracks using speculate()'s predicted positions, and run the Stage 2 gate per track.
+Calibrate on real clips (people, vehicles, debris) and replace hand-picked thresholds with fitted ones.
+Gait periodicity as a human-specific feature. This needs a longer history than the current 24-frame window.
+A real Stage 3 model, and measured (not modelled) hardware numbers.
+History
+
+The previous README documented v0.1, a Python/OpenCV prototype using MOG2 background subtraction, nearest-centroid tracking and hand-tuned motion heuristics, with a simulated heavy-AI stub. That script is not in this repository's current files. The old README text is still available in git history: git show c80c464:README.md.
+
+Credits
+
+Original EdgeFlow project: soumyadhoke-sys. v2 temporal speculation: Naman Sharma (Naman-D1).
